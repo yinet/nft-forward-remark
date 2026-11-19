@@ -44,18 +44,145 @@ nft 词法约定明确："A hash sign (#) begins a comment. All following charac
 ## 四、安装
 
 ```bash
-curl -L https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/nft.sh -o nft.sh
+curl -L https://raw.githubusercontent.com/yinet/nft-forward-remark/main/nft.sh -o nft.sh
 chmod +x nft.sh
 sudo ./nft.sh
 ```
 
-已装原版 v1.1 的机器**不需要重跑【安装 nftables】**（那会 `flush ruleset` 并备份走旧配置）。直接替换脚本文件后运行，用【查看】确认旧规则仍在，再用【修改备注】逐条补备注；备注在下次重写配置时落盘。
+首次安装直接选菜单【1 安装 nftables】。**已装旧版脚本的机器千万不要选 1**，见第五节。
 
-## 五、升级与回滚
+## 五、从 v1.1 升级（已装旧脚本的机器）
 
-- 首次运行前建议手工备份：`cp /etc/nftables.d/port-forward.conf /root/pf.conf.bak`
-- 脚本自身在每次写配置前会调用 `backup_conf`，备份落在 `/etc/nftables.d/backups/`
-- 回滚：用旧版脚本 + 备份文件覆盖 `port-forward.conf`，再 `nft -f /etc/nftables.d/port-forward.conf`
+### 原理：换脚本不动规则
+
+转发规则活在**内核 nftables 里**，备注活在 `/etc/nftables.d/port-forward.conf` 里，脚本只是一层读写这两个东西的外壳。所以替换脚本文件本身不会中断任何转发，也不需要重载规则。
+
+### 第 0 步：备份
+
+```bash
+cp /etc/nftables.d/port-forward.conf /root/port-forward.conf.v1.1.bak
+nft list table ip port_forward > /root/nft-port_forward.v1.1.bak
+```
+
+第二行备份的是"内核里实际生效的规则"，是配置文件和实际状态不一致时唯一可靠的对照物。
+
+### 第 1 步：绝不要选【1 安装 nftables】
+
+`do_install()` 的行为是：把 `/etc/nftables.conf` 与 `/etc/nftables.d/*.conf` 全部改名成 `.bak.时间戳`，然后 `nft flush ruleset` 清空内核规则，再由 `init_conf()` 生成一份**空规则**配置。
+
+后果：所有转发规则从内核和配置里同时消失，需要手工从 `.bak` 恢复。已装旧版的机器升级时**只需要替换脚本文件**，不需要跑安装。
+
+### 第 2 步：找到并替换旧脚本
+
+```bash
+# 定位旧脚本（常见位置）
+ls -l ./nft.sh /root/nft.sh /usr/local/bin/nft.sh /usr/local/bin/nftf 2>/dev/null
+```
+
+把新脚本放到同一位置并改名保持一致，旧文件留作回滚：
+
+```bash
+mv /usr/local/bin/nft.sh /usr/local/bin/nft.sh.v1.1
+# 把新的 nft.sh 拷入后
+chmod +x /usr/local/bin/nft.sh
+```
+
+### 第 3 步：确认新脚本接管了旧规则
+
+```bash
+sudo ./nft.sh    # 菜单标题应为 v1.2，共 8 项
+# 选【2 查看现有端口转发】
+```
+
+预期：旧规则全部列出，备注列为 `-`。此时内核规则一条没动，可以放心继续。
+
+### 第 4 步：补备注（两种方式）
+
+**方式 A：逐条，适合规则少（≤ 10 条）**
+
+选【5 修改备注】→ 输入序号 → 输入备注。每条会触发一次 `flush + nft -f`，规则表在毫秒级窗口内不存在（已建立的连接由 conntrack 维持，不影响正在传输的流量，但**新连接**可能在该瞬间未被 DNAT）。
+
+**方式 B：批量，适合规则多，且只 reload 一次**
+
+准备好端口与备注的对照表（Tab 分隔）：
+
+```bash
+cat > /root/notes.tsv <<'EOF'
+30001	香港落地A
+30002	日本中转
+30003	日本落地 备用
+EOF
+```
+
+按端口把 `# @note:` 标记写进配置：
+
+```bash
+cp /etc/nftables.d/port-forward.conf /root/pf.before-notes.bak
+python3 - <<'PY'
+import io, re
+conf = '/etc/nftables.d/port-forward.conf'
+notes = {}
+for ln in io.open('/root/notes.tsv', encoding='utf-8'):
+    ln = ln.rstrip('\n')
+    if not ln.strip() or ln.lstrip().startswith('#'):
+        continue
+    port, _, note = ln.partition('\t')
+    notes[port.strip()] = note.strip()
+
+pat = re.compile(r'tcp dport (\d+) dnat to (\d+\.\d+\.\d+\.\d+):(\d+)')
+out = []
+for ln in io.open(conf, encoding='utf-8'):
+    raw = ln.rstrip('\n')
+    m = pat.search(raw)
+    if m and '@note:' not in raw and m.group(1) in notes:
+        raw += '    # @note: ' + notes[m.group(1)]
+    out.append(raw + '\n')
+io.open(conf, 'w', encoding='utf-8').write(''.join(out))
+print('已处理端口数:', len(notes))
+PY
+```
+
+然后 reload 一次（等价于脚本内部的 `reload_rules`）：
+
+```bash
+nft flush table ip port_forward
+nft delete table ip port_forward
+nft -f /etc/nftables.d/port-forward.conf
+```
+
+### 第 5 步：验证
+
+```bash
+# 内核里实际 DNAT 条数（每条转发对应 tcp+udp 各一行，故应为规则数×2）
+nft list table ip port_forward | grep -c 'dnat to'
+# 脚本视角的规则与备注
+sudo ./nft.sh   # 选【2 查看现有端口转发】
+```
+
+两者数量对得上、备注列正确，即迁移完成。此后新增转发会在录入时直接问备注，配置重写时备注自动保留。
+
+### 回滚
+
+```bash
+cp /root/port-forward.conf.v1.1.bak /etc/nftables.d/port-forward.conf
+nft flush table ip port_forward
+nft delete table ip port_forward
+nft -f /etc/nftables.d/port-forward.conf
+mv /usr/local/bin/nft.sh.v1.1 /usr/local/bin/nft.sh
+```
+
+旧版脚本读到 `# @note:` 行尾注释不会有任何问题（它按 `tcp dport ... dnat to ...` 正则解析，行尾注释被忽略），所以回滚后规则完好，只是不再显示备注。
+
+### 注意事项
+
+- **手工改过 `port-forward.conf` 的机器要格外小心**：`load_rules()` 只认 `tcp dport N dnat to IP:P` 这一种模式，脚本自动生成的格式之外的手写规则（如端口段、`ip saddr` 限定、独立 chain），在脚本第一次重写配置时会**不进入 `RULES` 数组从而丢失**。升级前先对比：
+  ```bash
+  nft list table ip port_forward | grep -E 'dnat to|snat to'
+  grep -E 'dnat to' /etc/nftables.d/port-forward.conf
+  ```
+  两边不一致就先把手写规则摘出来，迁移完再单独维护。
+- **多层拓扑逐台升级**：Po0、RFC 中转机各自独立运行脚本，互不影响。建议先升级不承载主链路的那台验证。
+- **备注不跨机同步**：备注只存在本机配置文件里，换机时连同 `port-forward.conf` 一起拷走即可带过去。
 
 ## 六、兼容性
 
