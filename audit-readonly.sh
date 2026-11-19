@@ -133,7 +133,7 @@ done < <(grep -rl 'nftables 端口转发管理工具' /root /usr/local/bin /usr/
 [[ $found -eq 0 ]] && echo "  未在 /root /usr/local/bin /usr/bin /opt /home 找到脚本（可能在当前目录，可手动 ls）"
 
 sec "10. 防火墙与备份"
-printf 'firewalld : %s\n' "$(systemctl is-active firewalld 2>/dev/null || echo '未运行')"
+printf 'firewalld : %s\n' "$(systemctl is-active firewalld 2>/dev/null || true)"
 printf 'ufw       : %s\n' "$(command -v ufw >/dev/null 2>&1 && (ufw status 2>/dev/null | head -1) || echo '未安装')"
 printf '备份目录  : '
 if [[ -d /etc/nftables.d/backups ]]; then
