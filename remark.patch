@@ -1,0 +1,398 @@
+--- a/nft.sh
++++ b/nft.sh
+@@ -1,8 +1,15 @@
+ #!/usr/bin/env bash
+ #
+-# nftables 端口转发管理工具 v1.1
++# nftables 端口转发管理工具 v1.2
+ # 交互式管理 DNAT 端口转发规则
+ #
++# v1.2 相对 v1.1 的改动（仅新增备注能力，DNAT/SNAT 逻辑未变）：
++#   1. RULES 元素由 "本机端口|目标IP|目标端口" 扩展为 "...|备注"，备注可为空；
++#   2. 备注以行尾 "# @note: xxx" 形式写入 port-forward.conf，load_rules 反向解析；
++#   3. 新增菜单【修改备注】，可不删规则直接改备注；
++#   4. 查看/删除列表增加备注列（备注置于行尾，避免中文双宽字符导致列错位）；
++#   5. 所有 "IFS='|' read" 统一改为四字段读取，防止备注被拼进 dport。
++#
+ 
+ # ============== 常量定义 ==============
+ CONF_DIR="/etc/nftables.d"
+@@ -14,6 +21,9 @@
+ LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
+ TABLE_NAME="port_forward"
+ 
++# 备注最大长度（字符数），过长会撑坏列表显示
++NOTE_MAX_LEN=60
++
+ # ============== 日志函数 ==============
+ log_action() {
+     local msg="$1"
+@@ -65,6 +75,27 @@
+     return 0
+ }
+ 
++# ============== 备注净化 ==============
++# 备注是用户自由文本，会进入两处：RULES 数组（| 分隔）与 nft 配置文件的行尾注释。
++# 因此剔除会破坏数据结构的字符：分隔符 |、换行、反引号与 $（配置由 printf 写出，
++# 但仍提前剔除，避免任何解析层被注入）、反斜杠与双引号（防止将来改用内核 comment 时出错）。
++sanitize_note() {
++    local s="$1"
++    s="${s//$'\r'/}"
++    s="${s//$'\n'/}"
++    s="${s//|//}"
++    s="${s//\`/}"
++    s="${s//\$/}"
++    s="${s//\\/}"
++    s="${s//\"/}"
++    # 去掉首尾空白
++    s="${s#"${s%%[![:space:]]*}"}"
++    s="${s%"${s##*[![:space:]]}"}"
++    # 限长
++    s="${s:0:${NOTE_MAX_LEN}}"
++    printf '%s' "$s"
++}
++
+ # ============== 自动获取本机 IP ==============
+ get_local_ip() {
+     local ip
+@@ -129,7 +160,7 @@
+     local check_ip="$1" check_dport="$2" exclude_lport="$3"
+     local rule lport dip dport
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r lport dip dport <<< "$rule"
++        IFS='|' read -r lport dip dport _ <<< "$rule"
+         # 跳过正在删除的那条
+         [[ "$lport" == "$exclude_lport" ]] && continue
+         # 如果其他规则也指向同一 dest_ip:dport，返回 true
+@@ -309,20 +340,34 @@
+ }
+ 
+ # ============== 写出配置文件（基于当前 RULES 数组） ==============
+-# RULES 数组格式: "本机端口|目标IP|目标端口"
++# RULES 数组格式: "本机端口|目标IP|目标端口|备注"
++# 备注可为空；为空时该条不写 @note 标记，load_rules 读回空串。
+ declare -a RULES=()
+ 
++# 从配置文件反向解析 RULES。
++# 只认 "# @note: xxx" 标记，避免把脚本自己生成的 "# 转发: ..."/"# 回源: ..." 说明行误当备注。
+ load_rules() {
+     RULES=()
+     if [[ ! -f "${CONF_FILE}" ]]; then
+         return
+     fi
++
++    local line lport dip dport remark
+     while IFS= read -r line; do
+-        # 跳过注释行
++        # 跳过纯注释行
+         [[ "$line" =~ ^[[:space:]]*# ]] && continue
+         # 只解析 tcp 的 dnat 行（每对 tcp/udp 只记录一次）
+         if [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
+-            RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}")
++            lport="${BASH_REMATCH[1]}"
++            dip="${BASH_REMATCH[2]}"
++            dport="${BASH_REMATCH[3]}"
++            remark=""
++            if [[ "$line" =~ @note:[[:space:]]*(.*)$ ]]; then
++                remark="${BASH_REMATCH[1]}"
++                # 去掉行尾空白
++                remark="${remark%"${remark##*[![:space:]]}"}"
++            fi
++            RULES+=("${lport}|${dip}|${dport}|${remark}")
+         fi
+     done < "${CONF_FILE}"
+ }
+@@ -351,15 +396,22 @@
+         type nat hook prerouting priority -100; policy accept;
+ EOF
+ 
+-    local rule lport dip dport
++    # 备注用 printf 写出而非 heredoc，避免备注中的特殊字符被 shell 二次解释
++    local rule lport dip dport remark
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r lport dip dport <<< "$rule"
+-        cat >> "${tmp_file}" <<EOF
+-
+-        # 转发: 本机:${lport} -> ${dip}:${dport}
+-        tcp dport ${lport} dnat to ${dip}:${dport}
+-        udp dport ${lport} dnat to ${dip}:${dport}
+-EOF
++        IFS='|' read -r lport dip dport remark <<< "$rule"
++        {
++            printf '\n'
++            printf '        # 转发: 本机:%s -> %s:%s\n' "$lport" "$dip" "$dport"
++            if [[ -n "$remark" ]]; then
++                printf '        # 备注: %s\n' "$remark"
++                printf '        tcp dport %s dnat to %s:%s    # @note: %s\n' "$lport" "$dip" "$dport" "$remark"
++                printf '        udp dport %s dnat to %s:%s    # @note: %s\n' "$lport" "$dip" "$dport" "$remark"
++            else
++                printf '        tcp dport %s dnat to %s:%s\n' "$lport" "$dip" "$dport"
++                printf '        udp dport %s dnat to %s:%s\n' "$lport" "$dip" "$dport"
++            fi
++        } >> "${tmp_file}"
+     done
+ 
+     cat >> "${tmp_file}" <<EOF
+@@ -371,7 +423,7 @@
+ EOF
+ 
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r lport dip dport <<< "$rule"
++        IFS='|' read -r lport dip dport remark <<< "$rule"
+         cat >> "${tmp_file}" <<EOF
+ 
+         # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为本机 IP
+@@ -629,10 +681,10 @@
+     if [[ ${#RULES[@]} -gt 0 ]]; then
+         read -rp "是否测试目标连通性？[y/N]: " test_conn
+         if [[ "$test_conn" =~ ^[Yy]$ ]]; then
+-            local rule lport dip dport
++            local rule lport dip dport remark
+             for rule in "${RULES[@]}"; do
+-                IFS='|' read -r lport dip dport <<< "$rule"
+-                printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
++                IFS='|' read -r lport dip dport remark <<< "$rule"
++                printf "  测试 %s:%s (TCP)%s ... " "$dip" "$dport" "${remark:+ [$remark]}"
+                 if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
+                     printf "\033[32m通\033[0m\n"
+                 else
+@@ -764,15 +816,15 @@
+         return
+     fi
+ 
+-    printf "\n\033[1m%-6s %-10s %-10s    %-22s\033[0m\n" "序号" "协议" "本机端口" "目标地址"
+-    echo "──────────────────────────────────────────────────────"
++    printf "\n\033[1m%-6s %-10s %-10s    %-22s %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "备注"
++    echo "──────────────────────────────────────────────────────────────"
+ 
+     local idx=1
+-    local rule lport dip dport
++    local rule lport dip dport remark
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r lport dip dport <<< "$rule"
+-        printf "%-6s %-10s %-10s -> %-22s\n" \
+-            "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
++        IFS='|' read -r lport dip dport remark <<< "$rule"
++        printf "%-6s %-10s %-10s -> %-22s %s\n" \
++            "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "${remark:--}"
+         ((idx++))
+     done
+     echo ""
+@@ -812,7 +864,7 @@
+     # 检查端口是否已有转发规则
+     local rule rp
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r rp _ _ <<< "$rule"
++        IFS='|' read -r rp _ _ _ <<< "$rule"
+         if [[ "$rp" == "$lport" ]]; then
+             err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
+             return
+@@ -846,10 +898,16 @@
+         err "端口无效，请输入 1-65535 之间的数字。"
+     done
+ 
++    # 输入备注（可选）
++    local remark
++    echo ""
++    read -rp "请输入备注 (可留空，如: 香港落地A / 日本中转): " remark
++    remark=$(sanitize_note "$remark")
++
+     # 确认
+     echo ""
+     echo "即将添加转发规则:"
+-    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
++    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}${remark:+  备注: ${remark}}"
+     read -rp "确认添加？[Y/n]: " confirm
+     if [[ "$confirm" =~ ^[Nn]$ ]]; then
+         info "已取消。"
+@@ -858,15 +916,15 @@
+ 
+     # 备份并写入
+     backup_conf
+-    RULES+=("${lport}|${dip}|${dport}")
++    RULES+=("${lport}|${dip}|${dport}|${remark}")
+     if ! write_conf_file; then
+         return
+     fi
+ 
+     if reload_rules; then
+         firewall_open_port "$lport" "$dip" "$dport"
+-        info "转发规则添加成功: ${lport} → ${dip}:${dport}"
+-        log_action "新增转发: ${lport} -> ${dip}:${dport}"
++        info "转发规则添加成功: ${lport} → ${dip}:${dport}${remark:+  [${remark}]}"
++        log_action "新增转发: ${lport} -> ${dip}:${dport}${remark:+ 备注: ${remark}}"
+         info "若转发不通，请使用菜单中的【诊断/自检】排查。"
+     else
+         err "规则加载失败，请检查配置。"
+@@ -891,15 +949,15 @@
+     fi
+ 
+     # 展示列表
+-    printf "\n\033[1m%-6s %-10s %-10s    %-20s\033[0m\n" "序号" "协议" "本机端口" "目标地址"
+-    echo "────────────────────────────────────────────────────"
++    printf "\n\033[1m%-6s %-10s %-10s    %-20s %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "备注"
++    echo "────────────────────────────────────────────────────────────"
+ 
+     local idx=1
+-    local rule lport dip dport
++    local rule lport dip dport remark
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r lport dip dport <<< "$rule"
+-        printf "%-6s %-10s %-10s -> %-20s\n" \
+-            "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
++        IFS='|' read -r lport dip dport remark <<< "$rule"
++        printf "%-6s %-10s %-10s -> %-20s %s\n" \
++            "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "${remark:--}"
+         ((idx++))
+     done
+     echo ""
+@@ -919,10 +977,10 @@
+     fi
+ 
+     local target="${RULES[$((choice-1))]}"
+-    IFS='|' read -r lport dip dport <<< "$target"
++    IFS='|' read -r lport dip dport remark <<< "$target"
+ 
+     echo "即将删除转发规则:"
+-    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
++    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}${remark:+  备注: ${remark}}"
+     read -rp "确认删除？[Y/n]: " confirm
+     if [[ "$confirm" =~ ^[Nn]$ ]]; then
+         info "已取消。"
+@@ -941,15 +999,81 @@
+     if reload_rules; then
+         # nft 规则已成功更新后，再清理防火墙放行（RULES 已移除该条，dest_still_used 能正确判断）
+         firewall_close_port "$lport" "$dip" "$dport"
+-        info "转发规则已删除: ${lport} → ${dip}:${dport}"
+-        log_action "删除转发: ${lport} -> ${dip}:${dport}"
++        info "转发规则已删除: ${lport} → ${dip}:${dport}${remark:+  [${remark}]}"
++        log_action "删除转发: ${lport} -> ${dip}:${dport}${remark:+ 备注: ${remark}}"
++    else
++        err "规则加载失败，请检查配置。"
++    fi
++}
++
++# ====================================================
++# 功能 5：修改备注（v1.2 新增）
++# 只改备注，不触碰端口/IP，不重建防火墙放行，风险最低。
++# ====================================================
++do_note() {
++    echo ""
++    load_rules
++
++    if [[ ${#RULES[@]} -eq 0 ]]; then
++        info "当前没有端口转发规则，请先新增。"
++        return
++    fi
++
++    printf "\n\033[1m%-6s %-10s %-10s    %-22s %s\033[0m\n" "序号" "协议" "本机端口" "目标地址" "备注"
++    echo "──────────────────────────────────────────────────────────────"
++
++    local idx=1
++    local rule lport dip dport remark
++    for rule in "${RULES[@]}"; do
++        IFS='|' read -r lport dip dport remark <<< "$rule"
++        printf "%-6s %-10s %-10s -> %-22s %s\n" \
++            "$idx" "tcp+udp" "$lport" "${dip}:${dport}" "${remark:--}"
++        ((idx++))
++    done
++    echo ""
++
++    local choice
++    read -rp "请输入要修改备注的序号 (0 取消): " choice
++    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
++        info "已取消。"
++        return
++    fi
++    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
++        err "无效的序号。"
++        return
++    fi
++
++    local target="${RULES[$((choice-1))]}"
++    IFS='|' read -r lport dip dport remark <<< "$target"
++
++    local new_note
++    read -rp "请输入新备注 (当前: ${remark:--}，直接回车清空): " new_note
++    new_note=$(sanitize_note "$new_note")
++
++    if [[ "$new_note" == "$remark" ]]; then
++        info "备注未变化，无需修改。"
++        return
++    fi
++
++    backup_conf
++    RULES[$((choice-1))]="${lport}|${dip}|${dport}|${new_note}"
++
++    if ! write_conf_file; then
++        # 写入失败则回滚内存状态，避免后续操作基于脏数据
++        RULES[$((choice-1))]="${lport}|${dip}|${dport}|${remark}"
++        return
++    fi
++
++    if reload_rules; then
++        info "备注已更新: ${lport} → ${dip}:${dport}  [${new_note:--}]"
++        log_action "更新备注: ${lport} -> ${new_note:-(空)}"
+     else
+         err "规则加载失败，请检查配置。"
+     fi
+ }
+ 
+ # ====================================================
+-# 功能 5：一键清空所有转发
++# 功能 6：一键清空所有转发
+ # ====================================================
+ do_clear_all() {
+     echo ""
+@@ -977,7 +1101,7 @@
+     # 先清理所有防火墙规则（清空场景用 force，无需检查共享）
+     local rule lport dip dport
+     for rule in "${RULES[@]}"; do
+-        IFS='|' read -r lport dip dport <<< "$rule"
++        IFS='|' read -r lport dip dport _ <<< "$rule"
+         firewall_close_port "$lport" "$dip" "$dport" "force"
+     done
+ 
+@@ -1001,31 +1125,33 @@
+     while true; do
+         echo ""
+         echo "========================================"
+-        echo "   nftables 端口转发管理工具 v1.0"
++        echo "   nftables 端口转发管理工具 v1.2"
+         echo "========================================"
+         echo "  1) 安装 nftables"
+         echo "  2) 查看现有端口转发"
+         echo "  3) 新增端口转发"
+         echo "  4) 删除端口转发"
+-        echo "  5) 一键清空所有转发"
+-        echo "  6) 诊断/自检"
+-        echo "  7) 退出"
++        echo "  5) 修改备注"
++        echo "  6) 一键清空所有转发"
++        echo "  7) 诊断/自检"
++        echo "  8) 退出"
+         echo "========================================"
+-        read -rp "请选择操作 [1-7]: " choice
++        read -rp "请选择操作 [1-8]: " choice
+ 
+         case "$choice" in
+             1) do_install ;;
+             2) do_list ;;
+             3) do_add ;;
+             4) do_delete ;;
+-            5) do_clear_all ;;
+-            6) do_diagnose ;;
+-            7)
++            5) do_note ;;
++            6) do_clear_all ;;
++            7) do_diagnose ;;
++            8)
+                 info "再见！"
+                 exit 0
+                 ;;
+             *)
+-                err "无效选择，请输入 1-7。"
++                err "无效选择，请输入 1-8。"
+                 ;;
+         esac
+     done
