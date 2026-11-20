@@ -43,21 +43,79 @@ nft 词法约定明确："A hash sign (#) begins a comment. All following charac
 
 ## 四、安装
 
+### 4.0 先判断你属于哪种情况
+
+两种情况的操作**完全相反**：全新安装要跑菜单【1】，升级更新绝不能跑【1】。先确认：
+
+```bash
+nft list table ip port_forward 2>/dev/null | grep -c 'dnat to'
+```
+
+| 输出 | 情况 | 去往 |
+|---|---|---|
+| `0` 或报错（表不存在） | 全新机器，还没有任何转发 | [4.1 全新安装](#41-全新安装) |
+| 大于 `0` | 机器上已有转发在跑 | [4.2 升级更新](#42-升级更新已装-v10v11-的机器) |
+
+拿不准时，先跑仓库里的只读体检脚本（不写任何文件、不动规则）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/yinet/nft-forward-remark/main/audit-readonly.sh | sudo bash
+```
+
+若 raw 域名不通（境内机器常见），走 API 通道：
+
+```bash
+curl -fsSL -H "Accept: application/vnd.github.raw" \
+  "https://api.github.com/repos/yinet/nft-forward-remark/contents/audit-readonly.sh?ref=main" | sudo bash
+```
+
+体检会输出十节信息，其中 §4 是内核实际规则、§7 是"重写会丢失的行"、§9 是机器上旧脚本的版本，据此可确定该走哪条路。
+
+### 4.1 全新安装
+
+拉脚本：
+
 ```bash
 curl -L https://raw.githubusercontent.com/yinet/nft-forward-remark/main/nft.sh -o nft.sh
 chmod +x nft.sh
 sudo ./nft.sh
 ```
 
-首次安装直接选菜单【1 安装 nftables】。**已装旧版脚本的机器千万不要选 1**，见第五节。
+**第一步选【1 安装 nftables】**。脚本按机器现状分两条分支：
 
-## 五、从 v1.1 升级（已装旧脚本的机器）
+| 场景 | 动作 |
+|---|---|
+| 已有 nftables（多数云镜像） | 把 `/etc/nftables.conf` 与 `/etc/nftables.d/*.conf` 改名成 `.bak.时间戳` → `nft flush ruleset` → 开 IP 转发与 BBR/fq → 建空配置 → `nft -f` 验证 → 启用服务 |
+| 没有 nftables | 按发行版 `apt/dnf/yum/pacman` 装包 → 同样开转发与 BBR → 建配置 → 启用服务 |
 
-### 原理：换脚本不动规则
+**第二步选【3 新增端口转发】**，依次填写本机监听端口、目标 IP、目标端口（回车默认同端口）、备注（可留空）。
+
+**第三步选【2 查看现有端口转发】** 核对规则与备注。
+
+装完先验证四项：
+
+```bash
+nft list table ip port_forward              # 应见 prerouting / postrouting 两条链
+sysctl -n net.ipv4.ip_forward               # 应为 1
+sysctl -n net.ipv4.tcp_congestion_control   # 应为 bbr
+systemctl is-enabled nftables               # 应为 enabled
+```
+
+三个必须知道的限制：
+
+- **默认封禁端口**：该产品的 `80`、`443`、`8080`、`8443`、`8000`、`1080` 属默认封禁端口，转发到这些端口不会通。监听端口请避开。
+- **`flush ruleset` 的连带影响**：它清的是整个 nftables 规则集，不只是本脚本的表。若机器上还有别的东西依赖 nftables，会一起没了。非"刚重装"的机器先 `nft list tables` 看一眼。
+- **时间同步**：本脚本不校准时间，但协议握手对时间敏感。`timedatectl status | grep synchronized` 确认已同步。
+
+另有一个 UX 细节：在"已装 nftables"分支若对"是否继续"回答 `n`，脚本执行 `exit 0` 直接退出整个程序（不是返回菜单），需要重新运行。
+
+### 4.2 升级更新（已装 v1.0/v1.1 的机器）
+
+#### 原理：换脚本不动规则
 
 转发规则活在**内核 nftables 里**，备注活在 `/etc/nftables.d/port-forward.conf` 里，脚本只是一层读写这两个东西的外壳。所以替换脚本文件本身不会中断任何转发，也不需要重载规则。
 
-### 第 0 步：备份
+#### 第 1 步：备份
 
 ```bash
 cp /etc/nftables.d/port-forward.conf /root/port-forward.conf.v1.1.bak
@@ -66,28 +124,26 @@ nft list table ip port_forward > /root/nft-port_forward.v1.1.bak
 
 第二行备份的是"内核里实际生效的规则"，是配置文件和实际状态不一致时唯一可靠的对照物。
 
-### 第 1 步：绝不要选【1 安装 nftables】
+#### 第 2 步：绝不要选【1 安装 nftables】
 
-`do_install()` 的行为是：把 `/etc/nftables.conf` 与 `/etc/nftables.d/*.conf` 全部改名成 `.bak.时间戳`，然后 `nft flush ruleset` 清空内核规则，再由 `init_conf()` 生成一份**空规则**配置。
+`do_install()` 会把 `/etc/nftables.conf` 与 `/etc/nftables.d/*.conf` 全部改名成 `.bak.时间戳`，然后 `nft flush ruleset` 清空内核规则，再由 `init_conf()` 生成一份**空规则**配置。后果是所有转发从内核和配置里同时消失。
 
-后果：所有转发规则从内核和配置里同时消失，需要手工从 `.bak` 恢复。已装旧版的机器升级时**只需要替换脚本文件**，不需要跑安装。
+升级只需要替换脚本文件，不跑安装。
 
-### 第 2 步：找到并替换旧脚本
-
-```bash
-# 定位旧脚本（常见位置）
-ls -l ./nft.sh /root/nft.sh /usr/local/bin/nft.sh /usr/local/bin/nftf 2>/dev/null
-```
-
-把新脚本放到同一位置并改名保持一致，旧文件留作回滚：
+#### 第 3 步：替换脚本
 
 ```bash
-mv /usr/local/bin/nft.sh /usr/local/bin/nft.sh.v1.1
-# 把新的 nft.sh 拷入后
-chmod +x /usr/local/bin/nft.sh
+ls -l ./nft.sh /root/nft.sh /usr/local/bin/nft.sh /usr/local/bin/nftf 2>/dev/null   # 定位旧脚本
+
+cd /root
+curl -fsSL https://raw.githubusercontent.com/yinet/nft-forward-remark/main/nft.sh -o nft.sh.new
+grep -m1 -o '管理工具 v[0-9.]*' nft.sh.new     # 应输出 v1.2
+grep -c sanitize_note nft.sh.new               # 应大于 0
+
+mv nft.sh nft.sh.v1.1 && mv nft.sh.new nft.sh && chmod +x nft.sh   # 旧文件留作回滚
 ```
 
-### 第 3 步：确认新脚本接管了旧规则
+#### 第 4 步：确认接管
 
 ```bash
 sudo ./nft.sh    # 菜单标题应为 v1.2，共 8 项
@@ -96,11 +152,20 @@ sudo ./nft.sh    # 菜单标题应为 v1.2，共 8 项
 
 预期：旧规则全部列出，备注列为 `-`。此时内核规则一条没动，可以放心继续。
 
-### 第 4 步：补备注（两种方式）
+#### 第 5 步：补备注
+
+有一条前置检查必须先做——重写配置时脚本会用 `get_local_ip()` 重新推导 `define LOCAL_IP`（取 `ip route get 1.1.1.1` 的源地址），它决定转发流量的回程源地址（SNAT）。若推导结果与当前不同，回程可能中断：
+
+```bash
+ip route get 1.1.1.1 | grep -oP 'src \K[0-9.]+'
+grep 'define LOCAL_IP' /etc/nftables.d/port-forward.conf
+```
+
+两行一致才继续。注意云厂商机器（腾讯云等）网卡上是私网地址、公网由 EIP 映射，因此这里出现 `10.x` 是正常的。
 
 **方式 A：逐条，适合规则少（≤ 10 条）**
 
-选【5 修改备注】→ 输入序号 → 输入备注。每条会触发一次 `flush + nft -f`，规则表在毫秒级窗口内不存在（已建立的连接由 conntrack 维持，不影响正在传输的流量，但**新连接**可能在该瞬间未被 DNAT）。
+选【5 修改备注】→ 输入序号 → 输入备注。每条会触发一次 `flush + nft -f`，规则表在毫秒级窗口内不存在（已建立的连接由 conntrack 维持，正在传输的流量不受影响，但**新连接**可能在该瞬间未被 DNAT）。
 
 **方式 B：批量，适合规则多，且只 reload 一次**
 
@@ -150,7 +215,9 @@ nft delete table ip port_forward
 nft -f /etc/nftables.d/port-forward.conf
 ```
 
-### 第 5 步：验证
+该脚本只标注 `tcp` 行（`load_rules` 只读 tcp 行），判断条件里带 `@note:` 已存在则跳过，因此重复执行是幂等的。下一次任何写操作时，`write_conf_file` 会把 udp 行与 `# 备注:` 行一并补齐。
+
+#### 第 6 步：验证
 
 ```bash
 # 内核里实际 DNAT 条数（每条转发对应 tcp+udp 各一行，故应为规则数×2）
@@ -161,37 +228,39 @@ sudo ./nft.sh   # 选【2 查看现有端口转发】
 
 两者数量对得上、备注列正确，即迁移完成。此后新增转发会在录入时直接问备注，配置重写时备注自动保留。
 
-### 回滚
+#### 回滚
 
 ```bash
 cp /root/port-forward.conf.v1.1.bak /etc/nftables.d/port-forward.conf
 nft flush table ip port_forward
 nft delete table ip port_forward
 nft -f /etc/nftables.d/port-forward.conf
-mv /usr/local/bin/nft.sh.v1.1 /usr/local/bin/nft.sh
+mv /root/nft.sh.v1.1 /root/nft.sh
 ```
 
 旧版脚本读到 `# @note:` 行尾注释不会有任何问题（它按 `tcp dport ... dnat to ...` 正则解析，行尾注释被忽略），所以回滚后规则完好，只是不再显示备注。
 
-### 注意事项
+#### 注意事项
 
-- **手工改过 `port-forward.conf` 的机器要格外小心**：`load_rules()` 只认 `tcp dport N dnat to IP:P` 这一种模式，脚本自动生成的格式之外的手写规则（如端口段、`ip saddr` 限定、独立 chain），在脚本第一次重写配置时会**不进入 `RULES` 数组从而丢失**。升级前先对比：
+- **手工改过 `port-forward.conf` 的机器要格外小心**：`load_rules()` 只认 `tcp dport N dnat to IP:P` 这一种模式，脚本自动生成格式之外的手写规则（如端口段、`ip saddr` 限定、独立 chain），在脚本第一次重写配置时会**不进入 `RULES` 数组从而丢失**。升级前先对比：
+
   ```bash
   nft list table ip port_forward | grep -E 'dnat to|snat to'
   grep -E 'dnat to' /etc/nftables.d/port-forward.conf
   ```
-  两边不一致就先把手写规则摘出来，迁移完再单独维护。
+
+  两边不一致就先把手写规则摘出来，迁移完再单独维护。只读体检脚本的 §7 会自动列出这类行。
 - **多层拓扑逐台升级**：Po0、RFC 中转机各自独立运行脚本，互不影响。建议先升级不承载主链路的那台验证。
 - **备注不跨机同步**：备注只存在本机配置文件里，换机时连同 `port-forward.conf` 一起拷走即可带过去。
 
-## 六、兼容性
+## 五、兼容性
 
 - 旧配置文件（无 `@note`）可直接读取，备注显示为 `-`，不会报错、不会丢规则。
 - 未使用内核级 `comment "..."`，因此不依赖内核版本；代价是 `nft list ruleset` 中看不到备注（只有 `cat port-forward.conf` 或脚本内【查看】可见）。若需要 `nft list` 也显示备注，把规则行改为 `... dnat to IP:PORT comment "note:xxx"`（需内核 4.10+，comment 长度上限 128 字节）。
 
-## 七、测试
+## 六、测试
 
-仓库内改动经本地 17 项用例验证（写入/回读往返一致、旧配置兼容、删中间项重排、备注净化、共享目标判定等），全部通过。
+仓库内改动经本地 17 项用例验证（写入/回读往返一致、旧配置兼容、删中间项重排、备注净化、共享目标判定等），全部通过。`audit-readonly.sh` 另经模拟环境验证（伪造 `nft` 输出与含手写规则的样例配置）。
 
 ## 授权
 
